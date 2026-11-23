@@ -1,0 +1,27 @@
+From: Codex <codex@localhost>
+Subject: [PATCH] Preserve workqueue parallelism on P-only AMP topologies
+
+The AMP scheduler already runs every QoS on the performance cluster
+when the efficiency cluster is absent. Report the matching parallelism
+to the workqueue admission checks so Utility and Background requests
+can receive workers on homogeneous virtual machines.
+
+---
+ osfmk/kern/sched_amp_common.c | 5 +++++
+ 1 file changed, 5 insertions(+)
+
+diff --git a/osfmk/kern/sched_amp_common.c b/osfmk/kern/sched_amp_common.c
+--- a/osfmk/kern/sched_amp_common.c
++++ b/osfmk/kern/sched_amp_common.c
+@@ -486,6 +486,11 @@ sched_amp_qos_max_parallelism(int qos, uint64_t options)
+ 		return (options & QOS_PARALLELISM_CLUSTER_SHARED_RESOURCE) ? pcluster_count : pcount;
+ 	}
+ 
++	/* A P-only topology schedules every QoS on the P cluster. */
++	if (ecount == 0) {
++		return (options & QOS_PARALLELISM_CLUSTER_SHARED_RESOURCE) ? pcluster_count : pcount;
++	}
++
+ 	/*
+ 	 * The default AMP scheduler policy is to run utility and by
+ 	 * threads on E-Cores only.  Run-time policy adjustment unlocks

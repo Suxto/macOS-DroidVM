@@ -186,12 +186,20 @@ def main():
     parser.add_argument('--disable-agent', metavar='LABEL', action='append', default=[])
     parser.add_argument('--user', metavar='NAME:PASSWORD')
     parser.add_argument('--reduce-transparency', action='store_true')
+    parser.add_argument('--login-name-password', action='store_true',
+                        help='show the name and password fields at the login window')
+    parser.add_argument('--test-autologin', action='store_true',
+                        help='enable automatic login for the disposable account created by --user')
     parser.add_argument('--file', metavar='SOURCE:DEST', action='append', default=[])
+    parser.add_argument('--trust-executable', type=Path, action='append', default=[],
+                        help='include the code-directory hash of an additional guest executable')
     parser.add_argument('--base', type=Path, default=ARTIFACTS / 'disk/scratch-data.img')
     parser.add_argument('--store', type=Path)
     parser.add_argument('--disk', type=Path)
     parser.add_argument('bundles', nargs='+', type=Path)
     args = parser.parse_args()
+    if args.test_autologin and not args.user:
+        parser.error('--test-autologin requires --user')
     if args.store and args.disk:
         raise SystemExit('--store or --disk')
     bundles = [b.resolve() for b in args.bundles]
@@ -200,6 +208,11 @@ def main():
     hashes = [h for b in bundles for f in sorted(b.rglob('*')) if f.is_file() and (h := cdhash(f))]
     if args.probe:
         hashes.append(cdhash(args.probe))
+    for executable in args.trust_executable:
+        digest = cdhash(executable)
+        if digest is None:
+            parser.error(f'{executable} has no Mach-O code directory')
+        hashes.append(digest)
     OUT.mkdir(parents=True, exist_ok=True)
     trust = OUT / 'kernel.macho.trustcache'
     trust.write_bytes(trust_bundle(hashes, (ARTIFACTS / 'boot/kernel.macho.trustcache').read_bytes()))
@@ -345,6 +358,31 @@ def main():
                                    stdout=subprocess.DEVNULL, check=True)
                     subprocess.run(['sudo', 'chown', '0:0', str(keyboard)], check=True)
                     subprocess.run(['sudo', 'chmod', '644', str(keyboard)], check=True)
+                if args.login_name_password or args.test_autologin:
+                    path = mount / 'Library/Preferences/com.apple.loginwindow.plist'
+                    result = subprocess.run(['sudo', 'cat', str(path)], capture_output=True)
+                    if result.returncode and path.exists():
+                        result.check_returncode()
+                    prefs = plistlib.loads(result.stdout) if result.stdout else {}
+                    if args.login_name_password:
+                        prefs['SHOWFULLNAME'] = True
+                    if args.test_autologin:
+                        name, password = args.user.split(':', 1)
+                        prefs.update(autoLoginUser=name, autoLoginUserUID=501)
+                        key = bytes.fromhex('7d 89 52 23 d2 bc dd ea a3 b9 1f')
+                        payload = password.encode() + b'\0'
+                        payload += bytes(-len(payload) % 12)
+                        encoded = bytes(byte ^ key[index % len(key)] for index, byte in enumerate(payload))
+                        secret = mount / 'private/etc/kcpassword'
+                        subprocess.run(['sudo', 'install', '-o', '0', '-g', '0', '-m', '600',
+                                        '/dev/null', str(secret)], check=True)
+                        subprocess.run(['sudo', 'tee', str(secret)], input=encoded,
+                                       stdout=subprocess.DEVNULL, check=True)
+                    subprocess.run(['sudo', 'mkdir', '-p', str(path.parent)], check=True)
+                    subprocess.run(['sudo', 'tee', str(path)], input=plistlib.dumps(prefs),
+                                   stdout=subprocess.DEVNULL, check=True)
+                    subprocess.run(['sudo', 'chown', '0:0', str(path)], check=True)
+                    subprocess.run(['sudo', 'chmod', '644', str(path)], check=True)
                 cryptexes = mount / CRYPTEXES_LINK
                 if not cryptexes.is_symlink():
                     subprocess.run(['sudo', 'ln', '-s', '/System/Cryptexes', str(cryptexes)], check=True)

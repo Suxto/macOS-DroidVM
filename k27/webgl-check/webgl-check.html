@@ -1,0 +1,29 @@
+<!doctype html><meta charset="utf-8"><title>WebGL initialization test</title>
+<style>body{background:#17243b;color:white;font:18px monospace}canvas{width:360px;height:240px;margin:8px}pre{white-space:pre-wrap}</style>
+<h1>DroidVM WebGL GPU check</h1><div id="canvases"></div><pre id="result"></pre>
+<script>
+const results={};
+for(const type of ['webgl','webgl2']) {
+ const c=document.createElement('canvas');c.width=360;c.height=240;document.querySelector('#canvases').append(c);
+ try {
+  const gl=c.getContext(type,{preserveDrawingBuffer:true});
+  if(!gl){results[type]={available:false};continue;}
+  const r=results[type]={lost:gl.isContextLost(),error:gl.getError()};
+  if(r.lost)continue;
+  r.version=gl.getParameter(gl.VERSION);r.renderer=gl.getParameter(gl.RENDERER);
+  const ext=gl.getExtension('WEBGL_debug_renderer_info');if(ext)r.gpu=gl.getParameter(ext.UNMASKED_RENDERER_WEBGL);
+  const prefix=type==='webgl2'?'#version 300 es\n':'';
+  const vs=gl.createShader(gl.VERTEX_SHADER);gl.shaderSource(vs,prefix+(type==='webgl2'?'in':'attribute')+' vec2 pos;void main(){gl_Position=vec4(pos,0.,1.);}');gl.compileShader(vs);
+  const fs=gl.createShader(gl.FRAGMENT_SHADER);gl.shaderSource(fs,prefix+'precision mediump float;'+(type==='webgl2'?'out vec4 color;':'')+'void main(){'+(type==='webgl2'?'color':'gl_FragColor')+'=vec4(0.,1.,0.,1.);}');gl.compileShader(fs);
+  r.vertexCompiled=gl.getShaderParameter(vs,gl.COMPILE_STATUS);r.fragmentCompiled=gl.getShaderParameter(fs,gl.COMPILE_STATUS);
+  if(!r.vertexCompiled||!r.fragmentCompiled){r.shaderLog=gl.getShaderInfoLog(vs)+' '+gl.getShaderInfoLog(fs);continue;}
+  const p=gl.createProgram();gl.attachShader(p,vs);gl.attachShader(p,fs);gl.linkProgram(p);r.linked=gl.getProgramParameter(p,gl.LINK_STATUS);
+  if(!r.linked){r.programLog=gl.getProgramInfoLog(p);continue;}
+  gl.useProgram(p);const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,new Float32Array([-1,-1,3,-1,-1,3]),gl.STATIC_DRAW);
+  const a=gl.getAttribLocation(p,'pos');gl.enableVertexAttribArray(a);gl.vertexAttribPointer(a,2,gl.FLOAT,false,0,0);gl.viewport(0,0,c.width,c.height);
+  const start=performance.now();for(let i=0;i<120;i++){gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.drawArrays(gl.TRIANGLES,0,3);}gl.finish();r.draw120ms=performance.now()-start;
+  const pixel=new Uint8Array(4);gl.readPixels(180,120,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);r.pixel=[...pixel];r.error=gl.getError();r.lost=gl.isContextLost();r.passed=!r.lost&&r.error===0&&pixel[1]===255&&pixel[0]===0&&pixel[2]===0;
+ }catch(e){results[type]={exception:String(e)};}
+}
+document.querySelector('#result').textContent=JSON.stringify(results,null,2);document.title=JSON.stringify(results);
+</script>

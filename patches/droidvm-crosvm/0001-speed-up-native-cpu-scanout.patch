@@ -1,0 +1,137 @@
+diff --git a/gpu_display/src/lib.rs b/gpu_display/src/lib.rs
+--- a/gpu_display/src/lib.rs
++++ b/gpu_display/src/lib.rs
+@@ -127,8 +127,7 @@
+ }
+ 
+ // Match the macOS display driver's SDR conversion: clamp linear channels to [0, 1].
+-fn half_channel_to_byte(bytes: &[u8]) -> u8 {
+-    let bits = u16::from_le_bytes([bytes[0], bytes[1]]);
++const fn quantize_half_channel(bits: u16) -> u8 {
+     let exponent = (bits >> 10) & 31;
+-    let mantissa = u32::from(bits & 1023);
++    let mantissa = (bits & 1023) as u32;
+     if bits & 0x8000 != 0 || (exponent == 31 && mantissa != 0) {
+@@ -143,6 +142,21 @@
+         (1024 + mantissa, 25 - exponent)
+     };
+     ((significand * 255 + (1 << (shift - 1))) >> shift) as u8
++}
++
++static HALF_CHANNEL_BYTES: [u8; 1 << 16] = {
++    let mut table = [0; 1 << 16];
++    let mut bits = 0;
++    while bits < table.len() {
++        table[bits] = quantize_half_channel(bits as u16);
++        bits += 1;
++    }
++    table
++};
++
++#[inline]
++fn half_channel_to_byte(bytes: &[u8]) -> u8 {
++    HALF_CHANNEL_BYTES[usize::from(u16::from_le_bytes([bytes[0], bytes[1]]))]
+ }
+ 
+ fn convert_scanout_row(
+@@ -314,6 +328,8 @@
+     stride: u32,
+     bytes_per_pixel: u32,
+     fourcc: u32,
++    /// True only while the Android CPU producer holds the native window buffer lock.
++    android_window_buffer: bool,
+ }
+ 
+ impl<'a> GpuDisplayFramebuffer<'a> {
+@@ -329,6 +345,7 @@
+             stride,
+             bytes_per_pixel,
+             fourcc,
++            android_window_buffer: false,
+         }
+     }
+ 
+@@ -453,9 +470,18 @@
+                 // later does not require changing either producer or sink.
+                 (source, source_row_bytes.min(target_row_bytes))
+             };
+-            match dst.sub_slice(row * dst_stride, bytes_to_write) {
+-                Ok(target) => target.copy_from(&bytes[..bytes_to_write]),
+-                Err(_) => break,
++            let Ok(target) = dst.sub_slice(row * dst_stride, bytes_to_write) else {
++                break;
++            };
++            let bytes = &bytes[..bytes_to_write];
++            if self.android_window_buffer {
++                // SAFETY: ANativeWindow_lock grants CPU write access until flip posts
++                // the buffer. The source and target are both bounded to this row.
++                unsafe {
++                    std::ptr::copy(bytes.as_ptr(), target.as_mut_ptr(), bytes.len());
++                }
++            } else {
++                target.copy_from(bytes);
+             }
+         }
+     }
+@@ -1436,22 +1462,25 @@
+         .into_iter()
+         .flat_map(u16::to_le_bytes)
+         .collect();
+-        let mut target = [0xee; 12];
+-        let framebuffer = GpuDisplayFramebuffer::new(
+-            VolatileSlice::new(&mut target),
+-            6,
+-            4,
+-            DRM_FORMAT_XRGB8888,
+-        );
+-        framebuffer.copy_from_frame(&ScanoutFrame {
+-            bytes: &source,
+-            stride: 10,
+-            width: 1,
+-            height: 2,
+-            fourcc: DRM_FORMAT_ABGR16161616F,
+-            damage: Damage::Full,
+-        });
+-        assert_eq!(target, [0, 128, 255, 255, 0xee, 0xee, 64, 255, 0, 255, 0xee, 0xee]);
++        for android_window_buffer in [false, true] {
++            let mut target = [0xee; 12];
++            let mut framebuffer = GpuDisplayFramebuffer::new(
++                VolatileSlice::new(&mut target),
++                6,
++                4,
++                DRM_FORMAT_XRGB8888,
++            );
++            framebuffer.android_window_buffer = android_window_buffer;
++            framebuffer.copy_from_frame(&ScanoutFrame {
++                bytes: &source,
++                stride: 10,
++                width: 1,
++                height: 2,
++                fourcc: DRM_FORMAT_ABGR16161616F,
++                damage: Damage::Full,
++            });
++            assert_eq!(target, [0, 128, 255, 255, 0xee, 0xee, 64, 255, 0, 255, 0xee, 0xee]);
++        }
+     }
+ 
+     #[test]
+diff --git a/gpu_display/src/gpu_display_android.rs b/gpu_display/src/gpu_display_android.rs
+--- a/gpu_display/src/gpu_display_android.rs
++++ b/gpu_display/src/gpu_display_android.rs
+@@ -210,12 +210,14 @@
+             unsafe { slice::from_raw_parts_mut(anb.bits, buffer_size.try_into().unwrap()) };
+         // HAL_PIXEL_FORMAT_RGBA_8888 is R, G, B, A in memory, i.e. DRM AB24 on a
+         // little-endian host.
+-        Self::new(
++        let mut framebuffer = Self::new(
+             VolatileSlice::new(buffer),
+             stride_bytes,
+             BYTES_PER_PIXEL,
+             DRM_FORMAT_ABGR8888,
+-        )
++        );
++        framebuffer.android_window_buffer = true;
++        framebuffer
+     }
+ }
+ 

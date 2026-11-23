@@ -36,6 +36,13 @@ for old, new in [
     ('                      (isRenderServer() || access("/private/var/ngpu/debug/encode-thread",F_OK)==0);',
      '                      (isRenderServer() || !strcmp(getprogname(),"WindowServer") ||\n'
      '                       access("/private/var/ngpu/debug/encode-thread",F_OK)==0);'),
+    # WindowServer uses the macOS accelerator class for display holds and IOSurface synchronization.
+    ('if(!encodeThreadOn() || !isRenderServer() || access("/private/var/ngpu/debug/no-display-hold",F_OK)==0)',
+     'if(!encodeThreadOn() || strcmp(getprogname(),"WindowServer") || access("/private/var/ngpu/debug/no-display-hold",F_OK)==0)'),
+    ('if(!isRenderServer() || !available())return false;\n  const uint64_t answer=call(0,nullptr,0,2);',
+     'if(strcmp(getprogname(),"WindowServer") || !available())return false;\n  const uint64_t answer=call(0,nullptr,0,2);'),
+    ('if(answer==0x5265616457616974ull)return true;',
+     'if(answer==0x5265616457616974ull){fprintf(stderr,"NativeAdrenoMetal: waiting for IOSurface writers\\n");return true;}'),
     # The runtime converts a two-plane YCbCr texture on the CPU at every encoder that uses it (planes copied to staging, then a
     # dispatch): WindowServer's 4096x2160 wallpaper frames (YCBCR8_444_2P) took the 4 GiB guest into jetsam. Above 1 Mpx it is
     # refused here; the server has no other way to draw the wallpaper (refused, the desktop is never repainted where windows moved
@@ -83,6 +90,24 @@ for old, new in [
 ]:
     assert s.count(old) == 1, old
     s = s.replace(old, new)
+service = 'service(0,matching("IOAcceleratorES"))'
+assert s.count(service) == 2, service
+s = s.replace(service, 'service(0,matching("AGXAccelerator"))')
+# macOS WebCore and ANGLE reject all Metal devices without Mac2 before creating
+# an ES context. NativeMetal targets the iOS Apple families and withholds Mac2
+# for APIs (such as tessellation) which WebGL does not expose. Scope this
+# compatibility answer to those two clients; retain the runtime's actual
+# capability answers and refusals for every individual operation.
+old = 'static BOOL familyForCaller(id self,SEL _cmd,NSInteger family) {\n'
+new = old + ''' if(family==2002) {
+  Dl_info caller;
+  if(dladdr(__builtin_return_address(0),&caller) && caller.dli_fname &&
+     (strstr(caller.dli_fname,"/WebCore.framework/") ||
+      strstr(caller.dli_fname,"/libANGLE-shared.dylib")))return YES;
+ }
+'''
+assert s.count(old) == 1, old
+s = s.replace(old, new)
 # NMB_FRAME_ROWS=1 (diagnostics, research/debug-2026-10-27): WindowServer's telemetry table every 20 s without NATIVE_METAL_TIMING in
 # its launchd job, and each K row (a commit) with its GPU time (GPUEndTime - GPUStartTime) and its encoding (command buffer made to commit).
 import os

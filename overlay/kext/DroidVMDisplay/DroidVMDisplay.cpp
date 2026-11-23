@@ -113,6 +113,8 @@ struct VirtioGpuRect {uint32_t x, y, width, height;};
 extern "C" volatile uint64_t droidvm_virtio_gpu_commands;
 // DroidVMVirtioGpu3D.cpp: the number of the latest fenced 3D submission of any client, and whether every one up to a number has finished.
 extern "C" uint64_t droidvm_virtgpu_submitted(void);
+extern "C" uint64_t droidvm_virtgpu_holds(void);
+extern "C" bool droidvm_virtgpu_held(uint64_t, uint64_t *);
 extern "C" bool droidvm_virtgpu_finished(uint64_t);
 extern "C" bool droidvm_virtgpu_wait_finished(uint64_t, uint64_t);
 
@@ -224,7 +226,9 @@ private:
     struct ScanoutResource;
     ScanoutResource *scanoutResource(IOSurface *, uint32_t format);
     bool releaseResource(ScanoutResource &);
-    void requestCopy(IOSurface *, bool refresh, uint64_t work = 0);
+    struct GpuWork { uint64_t submitted, holds; };
+    void requestCopy(IOSurface *, bool refresh, GpuWork);
+    bool waitForGpu(GpuWork);
     void copyLoop();
     static void copyThreadMain(void *, wait_result_t);
     const uint8_t *surfaceBytes(IOSurface *, IOMemoryDescriptor *);
@@ -258,10 +262,9 @@ private:
     // Scheduling latency in the guest: the copy thread from its wakeup to running, the VBL timer past its period.
     uint64_t fCopyRequestTime, fWakeMaxNs, fWakeLate, fVBLDue, fVBLLateMaxNs, fVBLLate;
     uint64_t fSubmitTime[16], fFenceWaits, fFenceWaitNs, fFenceWaitMaxNs;   // diagnostic: swap submitted -> programmed (IOSurface fences)
-    // A swap's GPU work: the 3D submissions made before it (droidvm_virtgpu_submitted at swap_submit). The host reads the surface for
-    // the screen in another context, which does not wait for the guest's renderers: shown before that work has finished, a frame came
-    // out half drawn (the wallpaper twitched). The copy thread waits for it; the waits, their time and the ones given up after 200 ms.
-    uint64_t fSubmitWork[16], fCopyWork, fGpuWaits, fGpuWaitNs, fGpuWaitMaxNs, fGpuLate;
+    // A swap can reach the display while the Metal encoding thread is still preparing its GPU commands.
+    GpuWork fSubmitWork[16], fCopyWork, fShownWork;
+    uint64_t fHoldWaits, fGpuWaits, fGpuWaitNs, fGpuWaitMaxNs, fGpuLate;
     uint32_t fScanoutResource;
     unsigned fScanoutFailures;
 
@@ -370,8 +373,13 @@ bool DroidVMDisplay::start(IOService *provider)
         IOLog("DroidVMDisplay: virtio-gpu scanout %s%s (features %#llx)\n", why ? "off: " : "on", why ? why : "", fGpu.features());
         if (why)
             fGpu = VirtioGpu();
-        DroidVMVirtioGpu::selftest3D();   // vgpu-selftest=1: one DRM context through the host's drm2kgsl
+    } else {
+        unsigned use3D = 0;
+        PE_parse_boot_argn("vgpu-3d", &use3D, sizeof(use3D));
+        if (use3D)
+            DroidVMVirtioGpu::start();
     }
+    DroidVMVirtioGpu::selftest3D();   // vgpu-selftest=1: one DRM context through the host's drm2kgsl
     fCopyLock = IOLockAlloc();
     thread_t copier = nullptr;
     if (!fCopyLock || kernel_thread_start(copyThreadMain, this, &copier) != KERN_SUCCESS) {
@@ -383,7 +391,7 @@ bool DroidVMDisplay::start(IOService *provider)
         return false;
     }
     thread_deallocate(copier);
-    if (fGpu.ready())
+    if (fEntries && fGpu.ready())
         setProperty("CursorPlane", 1ULL, 32);
     if (!IOMobileFramebufferLegacy::start(provider)) {
         IOLog("DroidVMDisplay: IOMobileFramebufferLegacy::start failed\n");
@@ -518,11 +526,11 @@ IOReturn DroidVMDisplay::swap_begin_gated()
     if (fFrames == frames && fShown && fRefreshLeft) {
         unsigned elapsed = kRefreshTicks - --fRefreshLeft;
         if (!(elapsed & (elapsed - 1)) || !fRefreshLeft)
-            requestCopy(fShown, true);
-    } else if (fFrames == frames && fShown && fGpu.ready() && fTicks % fRefreshHz == 0) {
+            requestCopy(fShown, true, fShownWork);
+    } else if (fFrames == frames && fShown && fEntries && fGpu.ready() && fTicks % fRefreshHz == 0) {
         // A still screen sends nothing, and the app's window (re)created meanwhile (the activity resumed, rotated) stayed black:
         // flush the surface on screen once a second, a single command when the host scans it out.
-        requestCopy(fShown, true);
+        requestCopy(fShown, true, fShownWork);
     }
     if (at<IOMFBSwapIORequest *>(this, kSwapQueueFirst))
         fStalled++;
@@ -548,9 +556,9 @@ IOReturn DroidVMDisplay::swap_begin_gated()
                   fFenceWaitNs / fFenceWaits / 1000, fFenceWaitMaxNs / 1000);
         fFenceWaits = fFenceWaitNs = fFenceWaitMaxNs = 0;
         if (fGpuWaits)
-            IOLog("DroidVMDisplay: %llu frames waited for their GPU work, mean %llu us max %llu us, %llu given up\n", fGpuWaits,
-                  fGpuWaitNs / fGpuWaits / 1000, fGpuWaitMaxNs / 1000, fGpuLate);
-        fGpuWaits = fGpuWaitNs = fGpuWaitMaxNs = fGpuLate = 0;
+            IOLog("DroidVMDisplay: %llu frames waited for GPU work (%llu for submission), mean %llu us max %llu us, %llu timed out\n",
+                  fGpuWaits, fHoldWaits, fGpuWaitNs / fGpuWaits / 1000, fGpuWaitMaxNs / 1000, fGpuLate);
+        fHoldWaits = fGpuWaits = fGpuWaitNs = fGpuWaitMaxNs = fGpuLate = 0;
         fPeakFps = 0;
         IOLog("DroidVMDisplay: scheduling: %llu copy wakeups over 20 ms (longest %llu ms), %llu VBL ticks over 20 ms late (latest by %llu ms)\n",
               fWakeLate, fWakeMaxNs / 1000000, fVBLLate, fVBLLateMaxNs / 1000000);
@@ -589,10 +597,10 @@ IOReturn DroidVMDisplay::swap_wait(IOMobileFramebufferUserClient *client, unsign
 // IOSurface::createFence on each layer), so submit -> programmed is how long the swap waited for its frame's GPU work.
 IOReturn DroidVMDisplay::swap_submit(IOMFBSwapRec *rec, IOUserClient *client, unsigned int *out)
 {
-    if (rec)
-    {
-        fSubmitTime[reinterpret_cast<const uint32_t *>(rec)[38] % 16] = mach_absolute_time();
-        fSubmitWork[reinterpret_cast<const uint32_t *>(rec)[38] % 16] = droidvm_virtgpu_submitted();
+    if (rec) {
+        const auto slot = reinterpret_cast<const uint32_t *>(rec)[38] % 16;
+        fSubmitTime[slot] = mach_absolute_time();
+        fSubmitWork[slot] = {droidvm_virtgpu_submitted(), droidvm_virtgpu_holds()};
     }
     return IOMobileFramebufferLegacy::swap_submit(rec, client, out);
 }
@@ -732,7 +740,7 @@ void DroidVMDisplay::program_hardware_gated()
 {
     IOMFBSwapIORequest *swap = at<IOMFBSwapIORequest *>(this, kCurrentSwap);
     uint64_t &submitted = fSubmitTime[at<uint32_t>(swap, 980) % 16];
-    const uint64_t work = fSubmitWork[at<uint32_t>(swap, 980) % 16];
+    const GpuWork work = fSubmitWork[at<uint32_t>(swap, 980) % 16];
     if (submitted) {
         uint64_t waited = 0;
         absolutetime_to_nanoseconds(mach_absolute_time() - submitted, &waited);
@@ -791,6 +799,7 @@ void DroidVMDisplay::program_hardware_gated()
                 fFrameGapMaxNs = gap;
         }
         requestCopy(surface, false, work);
+        fShownWork = work;
         if (surface != fShown) {
             reinterpret_cast<OSObject *>(surface)->retain();
             if (fShown)
@@ -819,7 +828,7 @@ static uint8_t halfToByte(uint16_t half)
     return static_cast<uint8_t>((scaled + (1u << (shift - 1))) >> shift);
 }
 
-void DroidVMDisplay::requestCopy(IOSurface *surface, bool refresh, uint64_t work)
+void DroidVMDisplay::requestCopy(IOSurface *surface, bool refresh, GpuWork work)
 {
     reinterpret_cast<OSObject *>(surface)->retain();
     IOLockLock(fCopyLock);
@@ -848,6 +857,35 @@ void DroidVMDisplay::copyThreadMain(void *owner, wait_result_t)
     thread_terminate(current_thread());
 }
 
+bool DroidVMDisplay::waitForGpu(GpuWork work)
+{
+    const uint64_t begin = mach_absolute_time();
+    uint64_t order = 0, took = 0;
+    bool submitted = !work.holds || droidvm_virtgpu_held(work.holds, &order);
+    if (submitted && droidvm_virtgpu_finished(order > work.submitted ? order : work.submitted))
+        return true;
+
+    // The submitter runs in user space. Sleep on the copy thread so it can run even with one vCPU.
+    constexpr uint64_t timeoutNs = 200000000;
+    if (!submitted)
+        fHoldWaits++;
+    while (!submitted && took < timeoutNs) {
+        IOSleep(1);
+        submitted = droidvm_virtgpu_held(work.holds, &order);
+        absolutetime_to_nanoseconds(mach_absolute_time() - begin, &took);
+    }
+    const uint64_t remainingUs = took < timeoutNs ? (timeoutNs - took) / 1000 : 0;
+    const bool drawn = submitted && droidvm_virtgpu_wait_finished(order > work.submitted ? order : work.submitted, remainingUs);
+    absolutetime_to_nanoseconds(mach_absolute_time() - begin, &took);
+    fGpuWaits++;
+    fGpuWaitNs += took;
+    if (took > fGpuWaitMaxNs)
+        fGpuWaitMaxNs = took;
+    if (!drawn)
+        fGpuLate++;
+    return drawn;
+}
+
 void DroidVMDisplay::copyLoop()
 {
     IOLockLock(fCopyLock);
@@ -858,7 +896,7 @@ void DroidVMDisplay::copyLoop()
             continue;
         }
         bool refresh = fCopyRefresh;
-        const uint64_t work = fCopyWork;
+        const GpuWork work = fCopyWork;
         fCopyNext = nullptr;
         uint64_t waited = 0;
         absolutetime_to_nanoseconds(mach_absolute_time() - fCopyRequestTime, &waited);
@@ -868,19 +906,7 @@ void DroidVMDisplay::copyLoop()
             if (waited > fWakeMaxNs)
                 fWakeMaxNs = waited;
         }
-        if (!droidvm_virtgpu_finished(work)) {
-            const uint64_t begin = mach_absolute_time();
-            const bool drawn = droidvm_virtgpu_wait_finished(work, 200000);
-            uint64_t took = 0;
-            absolutetime_to_nanoseconds(mach_absolute_time() - begin, &took);
-            fGpuWaits++;
-            fGpuWaitNs += took;
-            if (took > fGpuWaitMaxNs)
-                fGpuWaitMaxNs = took;
-            if (!drawn)
-                fGpuLate++;
-        }
-        if (!scanOut(surface))
+        if (waitForGpu(work) && !scanOut(surface))
             copySurface(surface, refresh);
         reinterpret_cast<OSObject *>(surface)->release();
         IOLockLock(fCopyLock);
@@ -1027,7 +1053,8 @@ DroidVMDisplay::ScanoutResource *DroidVMDisplay::scanoutResource(IOSurface *surf
 // Stage 2: the host shows the surface (SET_SCANOUT_BLOB when it changes) and blits it now (RESOURCE_FLUSH). False: copy it instead.
 bool DroidVMDisplay::scanOut(IOSurface *surface)
 {
-    if (!fGpu.ready() || fScanoutFailures >= 8)
+    // The transport can be live for Metal while display output uses the CPU copy.
+    if (!fEntries || !fGpu.ready() || fScanoutFailures >= 8)
         return false;
     uint32_t pixelFormat = ioSurfacePixelFormat(surface);
     uint32_t format = pixelFormat == kFormatBGRA ? kVirtioFormatBGRX : pixelFormat == kFormatRGhA ? kVirtioFormatRGhA : 0;
@@ -1046,18 +1073,17 @@ bool DroidVMDisplay::scanOut(IOSurface *surface)
         if (!status)
             fScanoutResource = resource->id;
     }
-    if (!status) {
-        struct {VirtioGpuHeader h; VirtioGpuRect rect; uint32_t id, padding;} flush = {{0x104, 0, 0, 0, 0, {}}, {0, 0, width, height}, resource->id, 0};
-        // Unfenced: waiting for the host's blit (5 ms on average, 25 at worst) held this thread while newer swaps arrived, and the
-        // frames it had no time for were skipped -- the hitches of a window drag. The host reads a surface WindowServer does not
-        // draw into before a later swap replaces it.
-        status = fGpu.command(&flush, sizeof(flush), nullptr, 0, false);
-    }
     if (status) {
         if (++fScanoutFailures == 8)
-            IOLog("DroidVMDisplay: virtio-gpu scanout failed 8 times (last %#x); copying from now on\n", status);
+            IOLog("DroidVMDisplay: virtio-gpu scanout configuration failed 8 times (last %#x); copying from now on\n", status);
         return false;
     }
+    fScanoutFailures = 0;
+    struct {VirtioGpuHeader h; VirtioGpuRect rect; uint32_t id, padding;} flush = {{0x104, 0, 0, 0, 0, {}}, {0, 0, width, height}, resource->id, 0};
+    // The host may have no surface during an Android activity transition. Keep the
+    // fallback current and retry virtio presentation once a surface is attached.
+    if (fGpu.command(&flush, sizeof(flush), nullptr, 0, false))
+        return false;
     if (pixelFormat != fSurfaceFormat) {
         IOLog("DroidVMDisplay: virtio-gpu scanout of format %#x\n", pixelFormat);
         fSurfaceFormat = pixelFormat;

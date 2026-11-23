@@ -330,7 +330,7 @@ def make_adt(fdt, dram_size, unique_chip_id, output, cpu_regs='0', gpu=False, vi
                     '--output', str(output)], check=True)
 
 
-def build_boot_disk(local, trust, data, adt, line):
+def build_boot_disk(local, trust, data, adt, line, *, title='DroidVM: macOS 14.6.1 (23G93) on the DroidVM kernel'):
     stage = local / 'stage'
     payloads = stage / 'EFI/UniXNU/Payloads'
     payloads.mkdir(parents=True)
@@ -343,7 +343,7 @@ def build_boot_disk(local, trust, data, adt, line):
     shutil.copyfile(adt, payloads / 'kernel.macho.adt')
     (stage / 'EFI/UniXNU/unixnu.toml').write_text(
         'version = 1\n[boot]\ntimeout = 3\ndefault = "xnu"\n[kits]\nautoload = false\n[[driver]]\npath = "Payloads/DarwinBoot.efi"\n'
-        '[[entry]]\nid = "xnu"\ntitle = "DroidVM: macOS 14.6.1 (23G93) on the DroidVM kernel"\ntype = "xnu"\n'
+        '[[entry]]\nid = "xnu"\n' f'title = "{title}"\ntype = "xnu"\n'
         'path = "Payloads/kernel.macho"\ninitrd = "Payloads/scratch-data.img"\n' f'args = "{line}"\n')
     image = local / 'boot.img'
     env = dict(os.environ, MTOOLS_SKIP_CHECK='1', TZ='UTC')
