@@ -33,6 +33,10 @@ native=(overlay/kext/NativeVirtioBlock.json overlay/kext/NativeAES.json overlay/
 kc=$out/kc-piano-mmio.bin
 python3 -B out/k27-timesync-prelink.py out/kc/kc27-vma2-small.bin \
     out/k27/kernel-k27-builtin-platform-compact.macho "$kc" --keep "${keep[@]}" --native "${native[@]}"
-python3 "$fork/k27/pack-piano-mmio.py" --kernel "$kc" --adt out/k27-variants/gpu-selftest/guest.adt \
+present=()
+if [[ ${PIANO_CPU_PRESENT:-0} == 1 ]]; then
+    present+=(--cpu-present)
+fi
+python3 "$fork/k27/pack-piano-mmio.py" "${present[@]}" --kernel "$kc" --adt out/k27-variants/gpu-selftest/guest.adt \
     --trust out/metal/stage/kernel.macho.trustcache --seed "$tools/macos-27.2-metal-login/scratch-data.img" \
     --efi-inputs artifacts/boot-inputs --boot-inputs "$boot_inputs" "$out/package"

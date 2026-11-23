@@ -27,6 +27,10 @@ OUT` rebuilds the display kext, relinks the stock and local kexts, and packs
 the resulting collection. It reuses the lab build's generated kernel compiler
 recipes, ADT, and TimeSync prelink shim. The transport changes are staged in
 `OUT/transport`. They leave the lab's transport sources and output KC intact.
+For crosvm builds that misinterpret AB4H half-float scanout, pass
+`--cpu-present` to the packer or set `PIANO_CPU_PRESENT=1` for the build
+wrapper. The guest converts the presentation buffer to 8-bit for the App's
+native window while Metal still renders through the virtio GPU.
 
 For a side-by-side App instance, stop the source guest before copying its
 store. Place `boot.img`, a separate writable `data-store.img`, and the
@@ -47,6 +51,25 @@ its own boot, writable store, DTB, serial logs, and MAC address. Cloning an
 existing store preserves guest accounts and host keys, so treat it as a
 local test copy, not a distribution image. The host needs enough space for
 the copy and enough free hugepages to run the guest.
+
+## Tablet verification
+
+The first clone boot exposed a transport delay. The guest asked for sixteen
+GPU capset indices although the host exposed only DRM capset 6. Requests
+arrived at five-second intervals, delaying the first user-space capset fetch
+by about 80 seconds. The staged transport now reads `num_capsets` from the
+device and polls the used ring at most 10 ms after a missed wake, keeping
+the original outer deadline. One subsequent trace showed the index 0 query
+and capset fetch 12 ms apart, with no out-of-range requests. A second build
+produced a byte-identical kernel collection.
+
+The App clone booted 27.2 (26B8125), connected over virtio networking, and
+started Finder and Safari. WebGL 1 and 2 compiled, linked, rendered and read
+back the expected green pixel. The generic installed crosvm reported an
+unimplemented AB4H format switch. In CPU presentation mode, the Safari
+aquarium rendered in the native Android window at about 34 FPS in one
+sample. The WebKit GPU process mapped both NativeAdrenoMetal and Turnip.
+The boot-only Metal probe was disabled in the test clone during diagnosis.
 
 ## What transfers from the reference ports
 
