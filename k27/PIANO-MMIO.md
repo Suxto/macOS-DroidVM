@@ -22,6 +22,12 @@ python3 k27/pack-piano-mmio.py --kernel "$KC" --adt "$ADT" \
     --boot-inputs "$BOOT_INPUTS" out/piano-mmio-package
 ```
 
+For an existing K27 lab build, `bash k27/build-piano-gpu.sh BUILD BOOT_INPUTS
+OUT` rebuilds the display kext, relinks the stock and local kexts, and packs
+the resulting collection. It reuses the lab build's generated kernel compiler
+recipes, ADT, and TimeSync prelink shim. The transport changes are staged in
+`OUT/transport`. They leave the lab's transport sources and output KC intact.
+
 For a side-by-side App instance, stop the source guest before copying its
 store. Place `boot.img`, a separate writable `data-store.img`, and the
 matching `firmware.fd` in `/data/data/cn.classfun.droidvm/files/<instance>`
